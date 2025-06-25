@@ -3,8 +3,9 @@
 namespace AuthCliJwt;
 
 use Exception;
-use AuthCliJwt\StandardClock;
-use AuthCliJwt\ScopeChecker;
+use AuthCliJwt\lib\ScopeChecker;
+use AuthCliJwt\lib\StandardClock;
+use Jose\Component\Core\JWK;
 use Jose\Component\Checker\AudienceChecker;
 use Jose\Component\Signature\JWS;
 use Jose\Component\Checker\IssuerChecker;
@@ -13,7 +14,7 @@ use Jose\Component\Signature\JWSVerifier;
 use Jose\Component\Checker\IssuedAtChecker;
 use Jose\Component\Checker\NotBeforeChecker;
 use Jose\Component\KeyManagement\JWKFactory;
-use Jose\Component\Signature\Algorithm\RS256;
+use Jose\Component\Signature\Algorithm\HS256;
 use Jose\Component\Checker\ClaimCheckerManager;
 use Jose\Component\Checker\ExpirationTimeChecker;
 use Jose\Component\Checker\InvalidClaimException;
@@ -22,19 +23,27 @@ use Jose\Component\Signature\Serializer\JWSSerializerManager;
 
 class OAuthCli
 {
+    private JWK $privateJWK;
     private string $endpoint;
-    private $publicKey = null;
     private array $claims = [];
 
     public function __construct(
-        private string $pathToCert,
+        private string $secretAlg,
         private string $issuer,
-        private string $audience
+        private string $clientAud
     ) {
-        if (count($cer = glob($this->pathToCert)) > 0) {
-            $this->publicKey = JWKFactory::createFromCertificateFile($cer[0]);
-            $this->setPublicCER($cer[0]);
-        };
+        $this->setJWKPrivateKey();
+    }
+
+    private function setJWKPrivateKey()
+    {
+        $this->privateJWK = JWKFactory::createFromSecret(
+            $this->secretAlg,
+            [
+                'alg' => 'HS256',
+                'use' => 'sig'
+            ]
+        );
     }
 
     public function checkOAuth(string $endpoint): array
@@ -62,10 +71,10 @@ class OAuthCli
                 new CompactSerializer(),
             ]))->unserialize($tokenJws);
             $jwsVerifier = new JWSVerifier(new AlgorithmManager([
-                new RS256(),
+                new HS256(),
             ]));
 
-            if (!$jwsVerifier->verifyWithKey($jws, $this->publicKey, 0)) {
+            if (!$jwsVerifier->verifyWithKey($jws, $this->privateJWK, 0)) {
                 return [
                     'error' => 'signature_invalid',
                     'error_description' => 'The token is not valid. Failed signature verification.',
@@ -89,35 +98,32 @@ class OAuthCli
         }
     }
 
-    private function setPublicCER(string $pathToCER)
-    {
-        $this->publicKey = JWKFactory::createFromCertificateFile($pathToCER);
-    }
-
     private function checkClaims(JWS $jws): array
     {
         $claims = json_decode(($jws->getPayload()), true);
         $clock = new StandardClock;
         $claimCheckerManager = new ClaimCheckerManager(
             [
-                new ExpirationTimeChecker($clock),
-                new IssuedAtChecker($clock),
                 new NotBeforeChecker($clock),
+                new IssuedAtChecker($clock),
                 new IssuerChecker([
                     $this->issuer,
                 ]),
-                new AudienceChecker($this->audience),
-                new ScopeChecker($this->endpoint)
+                new AudienceChecker($this->clientAud),
+                new ScopeChecker($this->endpoint),
+                new ExpirationTimeChecker($clock),
             ]
         );
         try {
             $checkClaim = $claimCheckerManager->check($claims);
             return array_merge(['access' => 'allowed'], $checkClaim);
         } catch (InvalidClaimException $e) {
-            return [
-                'access' => 'denied',
-                'error' => $e->getMessage()
-            ];
+            $result['access'] = 'denied';
+            $result['error'] = $e->getMessage();
+            if ($e->getClaim() === 'exp') {
+                $result['status'] = 'expired';
+            }
+            return $result;
         }
     }
 
